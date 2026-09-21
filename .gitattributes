@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.lua text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+LICENSE text eol=lf

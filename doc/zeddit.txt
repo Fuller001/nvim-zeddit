@@ -1,0 +1,50 @@
+*zeddit.txt*  Local Zeta 2.1 next-edit suggestions for Neovim
+
+==============================================================================
+ORIGIN                                                            *zeddit-origin*
+
+Derived from https://github.com/Southporter/zeta.nvim (`trunk` /
+`fc7fe862`). That repository is currently an empty plugin template. Zeddit
+implements Zeta 2.1 / V0318 multi-region FIM completions against an
+OpenAI-compatible `/v1/completions` server.
+
+==============================================================================
+SETUP                                                              *zeddit-setup*
+
+>lua
+  require("zeddit").setup({
+    provider_url = "http://localhost:8000",
+    provider_model = "zeta-2.1",
+  })
+<
+
+Do not put machine-specific GGUF paths or API keys in the public repository.
+
+==============================================================================
+COMMANDS                                                        *zeddit-commands*
+
+:ZedditEnable          Enable globally
+:ZedditDisable         Disable globally
+:ZedditToggle          Toggle globally
+:ZedditToggleBuffer    Toggle in the current buffer
+:ZedditAccept          Apply the current ghost edit
+:ZedditClear           Dismiss the current preview
+:ZedditRequest         Force a request
+:ZedditStatus          Show URL / model / enabled state
+:ZedditConfig          Settings GUI
+:ZedditReset           Restore plugin-spec defaults
+
+==============================================================================
+KEYS                                                                *zeddit-keys*
+
+<leader>zz             Global toggle (snacks.nvim)
+<leader>zb             Buffer toggle (snacks.nvim)
+<Tab>                  Accept when wired through blink.cmp (see examples/lazy.lua)
+<M-l> / <C-l>          Accept (example spec)
+
+==============================================================================
+LICENSE                                                          *zeddit-license*
+
+MIT. See LICENSE.
+
+ vim:tw=78:ts=8:noet:ft=help:norl:

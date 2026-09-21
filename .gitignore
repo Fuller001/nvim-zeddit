@@ -1,0 +1,13 @@
+.DS_Store
+*.swp
+*.swo
+doc/tags
+.luarc.json
+.luacheckrc
+.idea/
+.vscode/
+*.gguf
+.env
+.env.*
+secrets.json
+zeddit-settings.json
