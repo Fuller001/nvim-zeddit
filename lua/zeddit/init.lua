@@ -89,6 +89,7 @@ local persist_keys = {
   "fim_max_tokens",
   "fim_max_lines",
   "auto_trigger",
+  "prompt_format",
 }
 
 local state = {
@@ -1592,6 +1593,13 @@ local function coerce_option(key, value)
     end
     return number
   end
+  if key == "prompt_format" then
+    local fmt = vim.trim(tostring(value or ""))
+    if fmt ~= "auto" and fmt ~= "Zeta2.1" and fmt ~= "Mellum2" then
+      return nil, "expected auto | Zeta2.1 | Mellum2"
+    end
+    return fmt
+  end
   if value == nil then
     value = ""
   else
@@ -1778,6 +1786,13 @@ local setting_fields = {
     desc = "Model id sent as `model`. For LM Studio this is usually the GGUF path.",
   },
   {
+    key = "prompt_format",
+    label = "Prompt format",
+    type = "choice",
+    values = { "auto", "Zeta2.1", "Mellum2" },
+    desc = "auto = follow the served model (live /props probe). Force Zeta2.1 or Mellum2 only when the probe is unavailable or wrong.",
+  },
+  {
     key = "api_key",
     label = "API key",
     type = "secret",
@@ -1951,6 +1966,28 @@ local function apply_setting_item(item, on_done)
   end
 
   local field = item.field
+  if field.type == "choice" then
+    vim.ui.select(field.values, {
+      prompt = field.label .. " (current: " .. tostring(current_setting_value(field)) .. ")",
+    }, function(choice)
+      if choice == nil then
+        if on_done then
+          on_done(false)
+        end
+        return
+      end
+      local ok, err = M.set(field.key, choice)
+      if not ok then
+        notify(field.label .. ": " .. err, vim.log.levels.WARN, true)
+      else
+        notify(field.label .. " = " .. display_option(field.key, M.get(field.key)), vim.log.levels.INFO, true)
+      end
+      if on_done then
+        on_done(ok)
+      end
+    end)
+    return
+  end
   if field.type == "boolean" then
     local ok, err = M.set(field.key, not current_setting_value(field))
     if not ok then
