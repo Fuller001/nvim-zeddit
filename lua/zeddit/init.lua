@@ -10,6 +10,9 @@ local MARKER_PATTERN = "<|marker_(%d+)|>"
 
 local defaults = {
   enabled = true,
+  -- false = no automatic ghost edits while typing; require("zeddit").request()
+  -- (manual trigger) keeps working.
+  auto_trigger = true,
 
   -- LM Studio's OpenAI-compatible completion endpoint.
   provider = "zeta",
@@ -18,7 +21,7 @@ local defaults = {
   provider_model = "zeta-2.1",
 
   -- Zeta 2.1 uses the V0318 Seed-Coder multi-region format.
-  prompt_format = "Zeta2.1",
+  prompt_format = "auto",
   -- Translate LSP hover documentation into Chinese through the chat
   -- endpoint. The original hover renders first; its float contents are
   -- swapped in place once the model answers (or instantly on cache hits).
@@ -85,6 +88,7 @@ local persist_keys = {
   "hover_max_tokens",
   "fim_max_tokens",
   "fim_max_lines",
+  "auto_trigger",
 }
 
 local state = {
@@ -597,42 +601,33 @@ end
 -- matches on model_path from llama-server's /props (falling back to the
 -- /v1/models id). Mellum* models complete through their trained FIM
 -- protocol; everything else falls back to the Zeta 2.1 raw-completions format.
-local function detect_model_name()
-  local ok, job = pcall(vim.system, {
-    "curl",
-    "--noproxy",
-    "*",
-    "--silent",
-    "--max-time",
-    "3",
-    props_url(state.opts.provider_url),
-  }, { text = true })
-  if ok then
-    local result = job:wait(4000)
-    if result and result.code == 0 then
-      local decoded_ok, decoded = pcall(vim.json.decode, result.stdout or "")
-      local path = decoded_ok and decoded and decoded.model_path
-      if type(path) == "string" then
-        return path:lower()
-      end
-    end
-  end
-  return ""
-end
+-- Forward declarations: the shared /props model probe is defined in the
+-- hover section below; resolve_format uses it as well.
+local hover_model --- kind: "mellum" | "zeta" | "other" | "down"
+local probe_hover_model
 
+-- Resolve prompt_format = "auto" from the live server model: the shared
+-- probe (10 s TTL) makes model switches take effect within seconds, without
+-- an nvim restart and without a blocking curl on the typing path.
 local function resolve_format()
   local fmt = state.opts.prompt_format
   if fmt ~= "auto" then
     return fmt
   end
-  if state.resolved_format then
-    return state.resolved_format
+  if hover_model.kind == "mellum" then
+    return "Mellum2"
   end
-  state.resolved_format = "Zeta2.1"
-  if detect_model_name():find("mellum", 1, true) then
-    state.resolved_format = "Mellum2"
+  if hover_model.kind == "zeta" then
+    return "Zeta2.1"
   end
-  return state.resolved_format
+  -- Probe result stale or missing: refresh in the background and meanwhile
+  -- fall back to the configured model string, then to Zeta.
+  probe_hover_model(function() end)
+  local model = (state.opts.provider_model or ""):lower()
+  if model:find("mellum", 1, true) then
+    return "Mellum2"
+  end
+  return "Zeta2.1"
 end
 
 -- Mellum2's trained completion mode is FIM (fill-in-the-middle) on the raw
@@ -805,9 +800,9 @@ end
 -- /props is probed with a 10 s cache: live model switches are picked up
 -- quickly and K never blocks on a probe. Basename match only -- directory
 -- names may contain model tokens (both GGUFs live in a "zeta-2.1-GGUF" dir).
-local hover_model = { kind = nil, at = 0 } --- kind: "mellum" | "other" | "down"
+hover_model = { kind = nil, at = 0 } --- kind: "mellum" | "zeta" | "other" | "down"
 
-local function probe_hover_model(cb)
+probe_hover_model = function(cb)
   if hover_model.kind ~= nil and os.time() - hover_model.at < 10 then
     cb(hover_model.kind == "mellum")
     return
@@ -824,7 +819,8 @@ local function probe_hover_model(cb)
             and props
             and type(props.model_path) == "string"
             and props.model_path:match("[^/\\]+$")
-          kind = (base and base:lower():find("mellum", 1, true)) and "mellum" or "other"
+          local lower = base and base:lower() or ""
+          kind = lower:find("mellum", 1, true) and "mellum" or (lower:find("zeta", 1, true) and "zeta" or "other")
         end
         local changed = hover_model.kind ~= kind
         if changed and kind ~= "mellum" then
@@ -864,7 +860,8 @@ sync_menu_labels = function()
   if not ok then
     return
   end
-  local completion = state.enabled and "auto completion: on" or "auto completion: off"
+  local auto = state.opts.auto_trigger and "auto completion: on" or "auto completion: off"
+  local master = state.enabled and "plugin (master): enabled" or "plugin (master): disabled"
   local hover
   if hover_model.kind ~= nil and hover_model.kind ~= "mellum" then
     hover = "hover translate: off (" .. hover_model.kind .. " model)"
@@ -872,13 +869,25 @@ sync_menu_labels = function()
     hover = state.opts.hover_translate and "hover translate: on" or "hover translate: off"
   end
   pcall(wk.add, {
-    { "<leader>zt", desc = completion },
+    { "<leader>zt", desc = auto },
+    { "<leader>zT", desc = master },
     { "<leader>zh", desc = hover },
   })
 end
 
 -- Quick toggle for hover translation, mirroring the settings-page switch
 -- (same option, persisted). Refuses to flip while the server runs Zeta.
+function M.toggle_auto_trigger()
+  local target = not state.opts.auto_trigger
+  local ok, err = M.set("auto_trigger", target)
+  if not ok then
+    vim.notify("[zeddit] " .. tostring(err), vim.log.levels.ERROR)
+    return false
+  end
+  vim.notify("[zeddit] auto completion: " .. (target and "on" or "off (manual via <M-g>)"))
+  sync_menu_labels()
+  return target
+end
 function M.toggle_hover_translate()
   if hover_model.kind ~= nil and hover_model.kind ~= "mellum" then
     vim.notify(
@@ -1503,6 +1512,12 @@ function M.request(force)
   local bufnr = vim.api.nvim_get_current_buf()
   if eligible(bufnr) then
     schedule_request(bufnr, 0, force == true)
+    return
+  end
+  -- Manual triggers must fail loudly: a silent no-op reads as "no
+  -- suggestion" and hides that the plugin itself is switched off.
+  if not state.enabled or not state.opts.enabled then
+    notify_error("zeddit is disabled (:ZedditToggle or <leader>zt to enable)")
   end
 end
 
@@ -1561,7 +1576,7 @@ local function parse_bool(value)
 end
 
 local function coerce_option(key, value)
-  if key == "enabled" or key == "notify_errors" or key == "hover_translate" or key == "hover_debug" then
+  if key == "enabled" or key == "notify_errors" or key == "hover_translate" or key == "hover_debug" or key == "auto_trigger" then
     return parse_bool(value)
   end
   if number_keys[key] then
@@ -1859,6 +1874,12 @@ local setting_fields = {
     desc = "Translate LSP hover docs into Chinese. Requires Mellum2 (chat-capable); auto-disabled while the server runs Zeta (completion-only).",
   },
   {
+    key = "auto_trigger",
+    label = "Auto trigger",
+    type = "boolean",
+    desc = "Request ghost edits automatically while typing. Off = manual only (map an insert-mode key to require('zeddit').request(true)).",
+  },
+  {
     key = "hover_max_tokens",
     label = "Hover max tokens",
     type = "integer",
@@ -2057,7 +2078,7 @@ function M.setup(user_opts)
   vim.api.nvim_create_autocmd("InsertEnter", {
     group = state.group,
     callback = function(args)
-      if eligible(args.buf) then
+      if state.opts.auto_trigger and eligible(args.buf) then
         schedule_request(args.buf, 100)
       end
     end,
@@ -2076,7 +2097,9 @@ function M.setup(user_opts)
         state.ignore_tick[args.buf] = nil
         return
       end
-      schedule_request(args.buf)
+      if state.opts.auto_trigger then
+        schedule_request(args.buf)
+      end
     end,
   })
 
@@ -2085,7 +2108,9 @@ function M.setup(user_opts)
     callback = function(args)
       if eligible(args.buf) then
         clear_pending(args.buf)
-        schedule_request(args.buf)
+        if state.opts.auto_trigger then
+          schedule_request(args.buf)
+        end
       end
     end,
   })
@@ -2121,6 +2146,9 @@ function M.setup(user_opts)
   end, { force = true })
   -- Initial menu labels once which-key has finished loading.
   vim.defer_fn(sync_menu_labels, 800)
+  -- Warm the shared model probe so the first completion/hover already knows
+  -- which model the server runs.
+  probe_hover_model(function() end)
   vim.api.nvim_create_user_command("ZedditToggleBuffer", function()
     M.toggle_buffer()
   end, { force = true })
