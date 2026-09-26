@@ -334,7 +334,13 @@ local function marker_offsets(text)
     local gap = line - last_boundary_line
     local target = nil
 
-    if gap >= 6 and line > 0 and blank(line) and line + 1 <= line_count and good_start(line + 1) then
+    if
+      gap >= 6
+      and line > 0
+      and blank(line)
+      and line + 1 <= line_count
+      and good_start(line + 1)
+    then
       -- The marker goes at the start of the non-blank line after the blank
       -- line.  Keep at least six lines in the following block.
       if line_count - line >= 6 then
@@ -788,7 +794,12 @@ local function translate_via_chat(source, on_done)
       end
       content = content:gsub("^%s*<think>.-</think>%s*", "")
       if choice and choice.finish_reason == "length" then
-        vim.api.nvim_echo({ { "[zeddit-hover] translation hit the token budget; showing partial result", "WarningMsg" } }, true, {})
+        vim.api.nvim_echo({
+          {
+            "[zeddit-hover] translation hit the token budget; showing partial result",
+            "WarningMsg",
+          },
+        }, true, {})
       end
       hover_cache[key] = content
       on_done(content)
@@ -821,12 +832,16 @@ probe_hover_model = function(cb)
             and type(props.model_path) == "string"
             and props.model_path:match("[^/\\]+$")
           local lower = base and base:lower() or ""
-          kind = lower:find("mellum", 1, true) and "mellum" or (lower:find("zeta", 1, true) and "zeta" or "other")
+          kind = lower:find("mellum", 1, true) and "mellum"
+            or (lower:find("zeta", 1, true) and "zeta" or "other")
         end
         local changed = hover_model.kind ~= kind
         if changed and kind ~= "mellum" then
           vim.api.nvim_echo({
-            { "[zeddit-hover] translation off: server model is " .. kind .. " (needs Mellum2)", "WarningMsg" },
+            {
+              "[zeddit-hover] translation off: server model is " .. kind .. " (needs Mellum2)",
+              "WarningMsg",
+            },
           }, true, {})
         end
         hover_model = { kind = kind, at = os.time() }
@@ -892,7 +907,9 @@ end
 function M.toggle_hover_translate()
   if hover_model.kind ~= nil and hover_model.kind ~= "mellum" then
     vim.notify(
-      ("[zeddit] hover translation unavailable: server model is %s (needs Mellum2)"):format(hover_model.kind),
+      ("[zeddit] hover translation unavailable: server model is %s (needs Mellum2)"):format(
+        hover_model.kind
+      ),
       vim.log.levels.WARN
     )
     return false
@@ -924,14 +941,30 @@ local function wrap_hover_renderer()
   state.hover_orig_ofp = current
   state.hover_wrapper_ofp = function(contents, syntax, opts, ...)
     if state.opts.hover_debug then
-      vim.api.nvim_echo({ { ("[zeddit-hover] ofp called: syntax=%s focus_id=%s"):format(tostring(syntax), tostring(opts and opts.focus_id)), "WarningMsg" } }, true, {})
+      vim.api.nvim_echo({
+        {
+          ("[zeddit-hover] ofp called: syntax=%s focus_id=%s"):format(
+            tostring(syntax),
+            tostring(opts and opts.focus_id)
+          ),
+          "WarningMsg",
+        },
+      }, true, {})
     end
     local bufnr, winid = state.hover_orig_ofp(contents, syntax, opts, ...)
     if bufnr and opts and opts.focus_id == "textDocument/hover" and syntax == "markdown" then
       local source = table.concat(contents, "\n")
       if #source:gsub("%s", "") > 0 then
-        if not hover_cache[vim.fn.sha256(source)] and winid and vim.api.nvim_win_is_valid(winid) then
-          pcall(vim.api.nvim_win_set_config, winid, { title = " Translating... ", title_pos = "center" })
+        if
+          not hover_cache[vim.fn.sha256(source)]
+          and winid
+          and vim.api.nvim_win_is_valid(winid)
+        then
+          pcall(
+            vim.api.nvim_win_set_config,
+            winid,
+            { title = " Translating... ", title_pos = "center" }
+          )
         end
         hover_dbg("translating hover (" .. #source .. " chars)")
         translate_hover_text(source, function(translated, err)
@@ -944,7 +977,11 @@ local function wrap_hover_renderer()
               )
               local fw = vim.fn.bufwinid(bufnr)
               if fw ~= -1 then
-                pcall(vim.api.nvim_win_set_config, fw, { title = " Translation failed ", title_pos = "center" })
+                pcall(
+                  vim.api.nvim_win_set_config,
+                  fw,
+                  { title = " Translation failed ", title_pos = "center" }
+                )
               end
             end
             return
@@ -956,7 +993,11 @@ local function wrap_hover_renderer()
           hover_dbg("replacing float contents (" .. #translated .. " chars)")
           local fw = vim.fn.bufwinid(bufnr)
           if fw ~= -1 then
-            pcall(vim.api.nvim_win_set_config, fw, { title = " Translated by zeddit ", title_pos = "center" })
+            pcall(
+              vim.api.nvim_win_set_config,
+              fw,
+              { title = " Translated by zeddit ", title_pos = "center" }
+            )
           end
           local tlines = vim.split(translated, "\n", { plain = true })
           vim.api.nvim_set_option_value("modifiable", true, { buf = bufnr })
@@ -1003,9 +1044,14 @@ local function wrap_noice_hover()
     end
     local cached = hover_cache[vim.fn.sha256(source)]
     if cached then
-      return state.hover_orig_noice(err, vim.tbl_extend("force", {}, result, {
-        contents = { kind = "markdown", value = cached },
-      }), ctx, config)
+      return state.hover_orig_noice(
+        err,
+        vim.tbl_extend("force", {}, result, {
+          contents = { kind = "markdown", value = cached },
+        }),
+        ctx,
+        config
+      )
     end
     state.hover_orig_noice(err, result, ctx, config)
     hover_dbg("translating noice hover (" .. #source .. " chars)")
@@ -1032,7 +1078,11 @@ local function wrap_noice_hover()
       -- the cursor into the open float and skip the update. Replicate its
       -- benign half instead: clear + reformat + reshow the hover message.
       local msg = docs.get("hover")
-      format.format(msg, { kind = "markdown", value = translated }, { ft = vim.bo[ctx.bufnr].filetype })
+      format.format(
+        msg,
+        { kind = "markdown", value = translated },
+        { ft = vim.bo[ctx.bufnr].filetype }
+      )
       docs.show(msg)
     end)
   end
@@ -1064,10 +1114,18 @@ local function install_hover_hook()
     if ok and type(nh.on_hover) == "function" then
       noice_src = debug.getinfo(nh.on_hover, "S").short_src
     end
-    vim.api.nvim_echo({ { ("[zeddit-hover] hook installed: translate=%s ofp_src=%s noice_src=%s"):format(tostring(state.opts.hover_translate), debug.getinfo(vim.lsp.util.open_floating_preview, "S").short_src, noice_src), "WarningMsg" } }, true, {})
+    vim.api.nvim_echo({
+      {
+        ("[zeddit-hover] hook installed: translate=%s ofp_src=%s noice_src=%s"):format(
+          tostring(state.opts.hover_translate),
+          debug.getinfo(vim.lsp.util.open_floating_preview, "S").short_src,
+          noice_src
+        ),
+        "WarningMsg",
+      },
+    }, true, {})
   end
 end
-
 
 local function parse_output(raw, old_editable)
   if type(raw) ~= "string" or raw == "" then
@@ -1284,7 +1342,12 @@ local function apply_pending(bufnr, pending)
     end
   else
     local end_row = pending.editable_end_line - 1
-    local current_lines = vim.api.nvim_buf_get_lines(bufnr, pending.editable_start_line, pending.editable_end_line, true)
+    local current_lines = vim.api.nvim_buf_get_lines(
+      bufnr,
+      pending.editable_start_line,
+      pending.editable_end_line,
+      true
+    )
     local end_col = #(current_lines[#current_lines] or "")
     vim.api.nvim_buf_set_text(
       bufnr,
@@ -1295,7 +1358,8 @@ local function apply_pending(bufnr, pending)
       split_lines(pending.new_text)
     )
 
-    local cursor_offset = math.max(0, math.min(pending.new_cursor_offset or #pending.new_text, #pending.new_text))
+    local cursor_offset =
+      math.max(0, math.min(pending.new_cursor_offset or #pending.new_text, #pending.new_text))
     local before_cursor = pending.new_text:sub(1, cursor_offset)
     local line_delta = 0
     for _ in before_cursor:gmatch("\n") do
@@ -1397,45 +1461,54 @@ local function request_now(bufnr, force)
   }
   state.jobs[bufnr] = request
 
-  local ok, job_or_error = pcall(vim.system, args, { text = true, stdin = payload }, function(result)
-    vim.schedule(function()
-      if state.jobs[bufnr] ~= request or state.generations[bufnr] ~= generation then
-        return
-      end
-      state.jobs[bufnr] = nil
+  local ok, job_or_error = pcall(
+    vim.system,
+    args,
+    { text = true, stdin = payload },
+    function(result)
+      vim.schedule(function()
+        if state.jobs[bufnr] ~= request or state.generations[bufnr] ~= generation then
+          return
+        end
+        state.jobs[bufnr] = nil
 
-      if not is_valid_buffer(bufnr) or vim.api.nvim_buf_get_changedtick(bufnr) ~= context.tick then
-        return
-      end
-      if result.code ~= 0 then
-        local detail = (result.stderr or result.stdout or "curl failed"):gsub("%s+$", "")
-        notify_error("request failed: " .. detail)
-        return
-      end
+        if
+          not is_valid_buffer(bufnr) or vim.api.nvim_buf_get_changedtick(bufnr) ~= context.tick
+        then
+          return
+        end
+        if result.code ~= 0 then
+          local detail = (result.stderr or result.stdout or "curl failed"):gsub("%s+$", "")
+          notify_error("request failed: " .. detail)
+          return
+        end
 
-      local decoded_ok, decoded = pcall(vim.json.decode, result.stdout or "")
-      if not decoded_ok or type(decoded) ~= "table" then
-        notify_error("LM Studio returned invalid JSON")
-        return
-      end
-      if decoded.error then
-        local detail = type(decoded.error) == "table" and (decoded.error.message or vim.inspect(decoded.error)) or tostring(decoded.error)
-        notify_error("LM Studio: " .. detail)
-        return
-      end
+        local decoded_ok, decoded = pcall(vim.json.decode, result.stdout or "")
+        if not decoded_ok or type(decoded) ~= "table" then
+          notify_error("LM Studio returned invalid JSON")
+          return
+        end
+        if decoded.error then
+          local detail = type(decoded.error) == "table"
+              and (decoded.error.message or vim.inspect(decoded.error))
+            or tostring(decoded.error)
+          notify_error("LM Studio: " .. detail)
+          return
+        end
 
-      local choice = decoded.choices and decoded.choices[1]
-      local parsed
-      if fmt == "Mellum2" then
-        parsed = parse_fim_output(choice and choice.text, context)
-      else
-        parsed = parse_output(choice and choice.text, context.editable)
-      end
-      if parsed then
-        set_preview(bufnr, context, parsed)
-      end
-    end)
-  end)
+        local choice = decoded.choices and decoded.choices[1]
+        local parsed
+        if fmt == "Mellum2" then
+          parsed = parse_fim_output(choice and choice.text, context)
+        else
+          parsed = parse_output(choice and choice.text, context.editable)
+        end
+        if parsed then
+          set_preview(bufnr, context, parsed)
+        end
+      end)
+    end
+  )
 
   if not ok then
     state.jobs[bufnr] = nil
@@ -1577,7 +1650,13 @@ local function parse_bool(value)
 end
 
 local function coerce_option(key, value)
-  if key == "enabled" or key == "notify_errors" or key == "hover_translate" or key == "hover_debug" or key == "auto_trigger" then
+  if
+    key == "enabled"
+    or key == "notify_errors"
+    or key == "hover_translate"
+    or key == "hover_debug"
+    or key == "auto_trigger"
+  then
     return parse_bool(value)
   end
   if number_keys[key] then
@@ -1942,7 +2021,11 @@ local function prompt_setting(field, on_done)
     if not ok then
       notify(field.label .. ": " .. err, vim.log.levels.WARN, true)
     else
-      notify(field.label .. " = " .. display_option(field.key, M.get(field.key)), vim.log.levels.INFO, true)
+      notify(
+        field.label .. " = " .. display_option(field.key, M.get(field.key)),
+        vim.log.levels.INFO,
+        true
+      )
     end
     if on_done then
       on_done(ok)
@@ -1980,7 +2063,11 @@ local function apply_setting_item(item, on_done)
       if not ok then
         notify(field.label .. ": " .. err, vim.log.levels.WARN, true)
       else
-        notify(field.label .. " = " .. display_option(field.key, M.get(field.key)), vim.log.levels.INFO, true)
+        notify(
+          field.label .. " = " .. display_option(field.key, M.get(field.key)),
+          vim.log.levels.INFO,
+          true
+        )
       end
       if on_done then
         on_done(ok)
@@ -1993,7 +2080,11 @@ local function apply_setting_item(item, on_done)
     if not ok then
       notify(field.label .. ": " .. err, vim.log.levels.WARN, true)
     else
-      notify(field.label .. " = " .. display_option(field.key, M.get(field.key)), vim.log.levels.INFO, true)
+      notify(
+        field.label .. " = " .. display_option(field.key, M.get(field.key)),
+        vim.log.levels.INFO,
+        true
+      )
     end
     if on_done then
       on_done(ok)
@@ -2107,7 +2198,8 @@ function M.setup(user_opts)
     group = state.group,
     callback = function(args)
       if is_valid_buffer(args.buf) then
-        state.last_text[args.buf] = table.concat(vim.api.nvim_buf_get_lines(args.buf, 0, -1, true), "\n")
+        state.last_text[args.buf] =
+          table.concat(vim.api.nvim_buf_get_lines(args.buf, 0, -1, true), "\n")
       end
     end,
   })
@@ -2221,30 +2313,34 @@ function M.setup(user_opts)
     if not ok or not snacks.toggle then
       return
     end
-    snacks.toggle({
-      name = "Zeddit",
-      get = function()
-        return M.get("enabled") == true
-      end,
-      set = function(enabled)
-        if enabled then
-          M.enable()
-        else
-          M.disable()
-        end
-      end,
-    }):map("<leader>zz")
-    snacks.toggle({
-      name = "Zeddit Buffer",
-      get = function()
-        return M.buffer_enabled()
-      end,
-      set = function(enabled)
-        if enabled ~= M.buffer_enabled() then
-          M.toggle_buffer({ notify = false })
-        end
-      end,
-    }):map("<leader>zb")
+    snacks
+      .toggle({
+        name = "Zeddit",
+        get = function()
+          return M.get("enabled") == true
+        end,
+        set = function(enabled)
+          if enabled then
+            M.enable()
+          else
+            M.disable()
+          end
+        end,
+      })
+      :map("<leader>zz")
+    snacks
+      .toggle({
+        name = "Zeddit Buffer",
+        get = function()
+          return M.buffer_enabled()
+        end,
+        set = function(enabled)
+          if enabled ~= M.buffer_enabled() then
+            M.toggle_buffer({ notify = false })
+          end
+        end,
+      })
+      :map("<leader>zb")
   end)
 end
 
