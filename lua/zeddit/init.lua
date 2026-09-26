@@ -19,9 +19,20 @@ local defaults = {
 
   -- Zeta 2.1 uses the V0318 Seed-Coder multi-region format.
   prompt_format = "Zeta2.1",
+  -- Translate LSP hover documentation into Chinese through the chat
+  -- endpoint. The original hover renders first; its float contents are
+  -- swapped in place once the model answers (or instantly on cache hits).
+  hover_translate = false,
+  -- Output token budget for one hover translation. Long docstrings easily
+  -- exceed 2048 tokens of Chinese, so keep this comfortably high.
+  hover_max_tokens = 4096,
+  -- Trace every gate of the hover translation path via vim.notify.
+  hover_debug = false,
   temperature = 0.0,
   top_k = 40,
   max_tokens = 160,
+  -- Mellum2 FIM completions: small budget keeps ghost-edit latency low.
+  fim_max_tokens = 128,
   prompt_budget_tokens = 1400,
   debounce_ms = 250,
   timeout_ms = 120000,
@@ -70,6 +81,10 @@ local persist_keys = {
   "editable_after_lines",
   "context_max_chars",
   "notify_errors",
+  "hover_translate",
+  "hover_max_tokens",
+  "fim_max_tokens",
+  "fim_max_lines",
 }
 
 local state = {
@@ -552,6 +567,498 @@ local function completion_url(base)
   return base .. "/v1/completions"
 end
 
+local function chat_url(base)
+  base = tostring(base or ""):gsub("/$", "")
+  if base:match("/v1/chat/completions$") then
+    return base
+  end
+  if base:match("/v1$") then
+    return base .. "/chat/completions"
+  end
+  return base .. "/v1/chat/completions"
+end
+
+local function models_url(base)
+  base = tostring(base or ""):gsub("/$", "")
+  if base:match("/v1$") then
+    return base .. "/models"
+  end
+  return base .. "/v1/models"
+end
+
+local function props_url(base)
+  base = tostring(base or ""):gsub("/$", "")
+  base = base:gsub("/v1$", "")
+  return base .. "/props"
+end
+
+-- Resolve prompt_format = "auto" by probing the server once per session.
+-- The fixed --alias hides the real model id from /v1/models, so detection
+-- matches on model_path from llama-server's /props (falling back to the
+-- /v1/models id). Mellum* models complete through their trained FIM
+-- protocol; everything else falls back to the Zeta 2.1 raw-completions format.
+local function detect_model_name()
+  local ok, job = pcall(vim.system, {
+    "curl",
+    "--noproxy",
+    "*",
+    "--silent",
+    "--max-time",
+    "3",
+    props_url(state.opts.provider_url),
+  }, { text = true })
+  if ok then
+    local result = job:wait(4000)
+    if result and result.code == 0 then
+      local decoded_ok, decoded = pcall(vim.json.decode, result.stdout or "")
+      local path = decoded_ok and decoded and decoded.model_path
+      if type(path) == "string" then
+        return path:lower()
+      end
+    end
+  end
+  return ""
+end
+
+local function resolve_format()
+  local fmt = state.opts.prompt_format
+  if fmt ~= "auto" then
+    return fmt
+  end
+  if state.resolved_format then
+    return state.resolved_format
+  end
+  state.resolved_format = "Zeta2.1"
+  if detect_model_name():find("mellum", 1, true) then
+    state.resolved_format = "Mellum2"
+  end
+  return state.resolved_format
+end
+
+-- Mellum2's trained completion mode is FIM (fill-in-the-middle) on the raw
+-- completions endpoint: <fim_prefix>..<fim_suffix>..<fim_middle>. Driving it
+-- through a chat template makes it answer conversationally instead of
+-- completing code, and the small token budget keeps ghost edits fast.
+local function editable_cursor_offset(context)
+  local lines = vim.split(context.editable, "\n", { plain = true })
+  local row = context.cursor_row - context.editable_start_line + 1
+  local offset = 0
+  for i = 1, row - 1 do
+    offset = offset + #(lines[i] or "") + 1
+  end
+  return offset + context.cursor_col
+end
+
+local function mellum_fim_prompt(context)
+  local cursor_abs = context.editable_start_rel + editable_cursor_offset(context)
+  local prefix = context.context:sub(1, cursor_abs)
+  local suffix = context.context:sub(cursor_abs + 1)
+  return "<fim_prefix>" .. prefix .. "<fim_suffix>" .. suffix .. "<fim_middle>"
+end
+
+-- The FIM answer is the raw middle text; the editable-region rewrite is the
+-- old region with that middle inserted at the cursor offset.
+local function trim_fim_middle(middle)
+  local lines = vim.split(middle, "\n", { plain = true })
+  local run = 1
+  local cut = #lines
+  for i = 2, #lines do
+    if lines[i] == lines[i - 1] and lines[i]:match("%S") then
+      run = run + 1
+      if run >= 3 then
+        cut = i - 2
+        break
+      end
+    else
+      run = 1
+    end
+  end
+  cut = math.min(cut, state.opts.fim_max_lines or 5)
+  return table.concat(lines, "\n", 1, cut)
+end
+
+local function parse_fim_output(middle, context)
+  if type(middle) ~= "string" then
+    return nil
+  end
+  middle = middle:gsub("<|endoftext|>", "")
+  -- Without a stop event the model fills the whole token budget with
+  -- paragraph-less continuation; greedy decoding can also loop one line
+  -- forever. Truncate exact-duplicate runs and cap the line count.
+  middle = trim_fim_middle(middle)
+  local offset = editable_cursor_offset(context)
+  local after = context.editable:sub(offset + 1)
+  -- Mid-line cursor with text following: the model tends to echo that text
+  -- or ramble past it. Keep the suggestion on the current line...
+  if after:match("^[^\n]*%S") then
+    middle = middle:match("^[^\n]*")
+  end
+  -- ...and cut a tail that duplicates what already sits after the cursor.
+  for k = math.min(#middle, #after), 1, -1 do
+    if middle:sub(-k) == after:sub(1, k) then
+      middle = middle:sub(1, #middle - k)
+      break
+    end
+  end
+  if middle:gsub("%s", "") == "" then
+    return nil
+  end
+  local text = context.editable:sub(1, offset) .. middle .. after
+  if text == context.editable then
+    return nil
+  end
+  return { text = text, cursor_offset = nil }
+end
+
+-- --------------------------------------------------------------------------
+-- LSP hover translation (opt-in via hover_translate = true).
+--
+-- Two hook points cover both hover renderers:
+--  * native Neovim hover ends in vim.lsp.util.open_floating_preview
+--    (wrapped below; 0.12 bypasses vim.lsp.handlers, so the handler table
+--    is not a viable hook point);
+--  * noice.nvim replaces vim.lsp.buf.hover and routes results to its own
+--    on_hover (wrapped below; it never calls open_floating_preview).
+-- Whichever path renders the float, the original English documentation
+-- shows first and is then replaced in place with the Chinese translation
+-- (or instantly on cache hits). Translation requires a chat-capable model:
+-- while the server runs Zeta 2.1 (completion-only) it is disabled entirely,
+-- re-probed every 10 s so live model switches are picked up. Failures are
+-- reported loudly, leaving the original English float untouched.
+-- --------------------------------------------------------------------------
+-- Assigned later next to the hover model gate; M.enable/M.disable call it to
+-- keep the <leader>z menu labels fresh.
+local sync_menu_labels
+
+local HOVER_TRANSLATE_PROMPT = table.concat({
+  "你是技术文档翻译器。把用户给出的 LSP 悬浮文档翻译成简体中文。",
+  "规则：保留所有代码、类型签名、标识符、参数名与 markdown 结构（含代码块）原样不动；",
+  "只翻译自然语言说明文字；不要添加任何解释或前后缀。",
+  "必须逐段完整翻译全部内容，不得省略、概括或跳过任何段落、参数说明、返回值说明、异常说明或示例。",
+})
+
+local hover_cache = {}
+
+local function hover_dbg(msg)
+  if state.opts.hover_debug then
+    vim.api.nvim_echo({ { "[zeddit-hover] " .. msg, "WarningMsg" } }, true, {})
+  end
+end
+
+local function translate_via_chat(source, on_done)
+  local key = vim.fn.sha256(source)
+  if hover_cache[key] then
+    on_done(hover_cache[key])
+    return
+  end
+  local payload = vim.json.encode({
+    model = state.opts.provider_model,
+    temperature = 0.0,
+    max_tokens = state.opts.hover_max_tokens or 4096,
+    messages = {
+      { role = "system", content = HOVER_TRANSLATE_PROMPT },
+      { role = "user", content = source },
+    },
+  })
+  local args = {
+    "curl",
+    "--noproxy",
+    "*",
+    "--silent",
+    "--max-time",
+    "120",
+    "-H",
+    "Content-Type: application/json",
+  }
+  if state.opts.api_key and state.opts.api_key ~= "" then
+    args[#args + 1] = "-H"
+    args[#args + 1] = "Authorization: Bearer " .. state.opts.api_key
+  end
+  args[#args + 1] = "--data-binary"
+  args[#args + 1] = "@-"
+  args[#args + 1] = chat_url(state.opts.provider_url)
+  vim.system(args, { text = true, stdin = payload }, function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then
+        on_done(nil, "curl exit " .. result.code .. ": " .. (result.stderr or ""):sub(1, 120))
+        return
+      end
+      local ok, decoded = pcall(vim.json.decode, result.stdout or "")
+      local choice = ok and decoded and decoded.choices and decoded.choices[1]
+      local content = choice and choice.message and choice.message.content
+      if type(content) ~= "string" or content == "" then
+        on_done(nil, "empty response from server")
+        return
+      end
+      content = content:gsub("^%s*<think>.-</think>%s*", "")
+      if choice and choice.finish_reason == "length" then
+        vim.api.nvim_echo({ { "[zeddit-hover] translation hit the token budget; showing partial result", "WarningMsg" } }, true, {})
+      end
+      hover_cache[key] = content
+      on_done(content)
+    end)
+  end)
+end
+
+-- Model gate for hover translation. Zeta 2.1 is a raw completion model that
+-- cannot chat, so translation is fully disabled while the server runs it.
+-- /props is probed with a 10 s cache: live model switches are picked up
+-- quickly and K never blocks on a probe. Basename match only -- directory
+-- names may contain model tokens (both GGUFs live in a "zeta-2.1-GGUF" dir).
+local hover_model = { kind = nil, at = 0 } --- kind: "mellum" | "other" | "down"
+
+local function probe_hover_model(cb)
+  if hover_model.kind ~= nil and os.time() - hover_model.at < 10 then
+    cb(hover_model.kind == "mellum")
+    return
+  end
+  vim.system(
+    { "curl", "--noproxy", "*", "--silent", "--max-time", "3", props_url(state.opts.provider_url) },
+    { text = true },
+    function(result)
+      vim.schedule(function()
+        local kind = "down"
+        if result.code == 0 then
+          local ok, props = pcall(vim.json.decode, result.stdout or "")
+          local base = ok
+            and props
+            and type(props.model_path) == "string"
+            and props.model_path:match("[^/\\]+$")
+          kind = (base and base:lower():find("mellum", 1, true)) and "mellum" or "other"
+        end
+        local changed = hover_model.kind ~= kind
+        if changed and kind ~= "mellum" then
+          vim.api.nvim_echo({
+            { "[zeddit-hover] translation off: server model is " .. kind .. " (needs Mellum2)", "WarningMsg" },
+          }, true, {})
+        end
+        hover_model = { kind = kind, at = os.time() }
+        if changed then
+          sync_menu_labels()
+        end
+        cb(kind == "mellum")
+      end)
+    end
+  )
+end
+
+-- Gate wrapper: cache hits answer instantly; misses are translated only when
+-- the server currently runs Mellum2. Gated misses call on_done(nil) with no
+-- error so callers skip quietly.
+local function translate_hover_text(source, on_done)
+  probe_hover_model(function(ok)
+    if not ok then
+      hover_dbg("translation disabled: server is not running Mellum2")
+      on_done(nil)
+      return
+    end
+    translate_via_chat(source, on_done)
+  end)
+end
+
+-- Refresh which-key labels for the <leader>z toggles. which-key cannot grey
+-- out entries, so a Zeta-gated toggle is labelled with the serving model
+-- instead. No-op without which-key or when the user maps different keys.
+sync_menu_labels = function()
+  local ok, wk = pcall(require, "which-key")
+  if not ok then
+    return
+  end
+  local completion = state.enabled and "auto completion: on" or "auto completion: off"
+  local hover
+  if hover_model.kind ~= nil and hover_model.kind ~= "mellum" then
+    hover = "hover translate: off (" .. hover_model.kind .. " model)"
+  else
+    hover = state.opts.hover_translate and "hover translate: on" or "hover translate: off"
+  end
+  pcall(wk.add, {
+    { "<leader>zt", desc = completion },
+    { "<leader>zh", desc = hover },
+  })
+end
+
+-- Quick toggle for hover translation, mirroring the settings-page switch
+-- (same option, persisted). Refuses to flip while the server runs Zeta.
+function M.toggle_hover_translate()
+  if hover_model.kind ~= nil and hover_model.kind ~= "mellum" then
+    vim.notify(
+      ("[zeddit] hover translation unavailable: server model is %s (needs Mellum2)"):format(hover_model.kind),
+      vim.log.levels.WARN
+    )
+    return false
+  end
+  local target = not state.opts.hover_translate
+  local ok, err = M.set("hover_translate", target)
+  if not ok then
+    vim.notify("[zeddit] " .. tostring(err), vim.log.levels.ERROR)
+    return false
+  end
+  vim.notify("[zeddit] hover translate: " .. (target and "on" or "off"))
+  sync_menu_labels()
+  return target
+end
+-- Hook the one rendering funnel every hover implementation ends up in:
+-- vim.lsp.util.open_floating_preview. Neovim 0.12's vim.lsp.buf.hover
+-- aggregates clients internally and never consults vim.lsp.handlers, so the
+-- handler table is not a viable hook point. Scoped by focus_id so ONLY
+-- hover floats are touched; signature help, diagnostics and every other
+-- caller pass through byte-identical. Content is swapped keyed on the float
+-- BUFFER (recovered via bufwinid), never the window id, so cursor movement
+-- during the model round-trip cannot strand the translation.
+local function wrap_hover_renderer()
+  local util = vim.lsp.util
+  local current = util.open_floating_preview
+  if current == state.hover_wrapper_ofp then
+    return
+  end
+  state.hover_orig_ofp = current
+  state.hover_wrapper_ofp = function(contents, syntax, opts, ...)
+    if state.opts.hover_debug then
+      vim.api.nvim_echo({ { ("[zeddit-hover] ofp called: syntax=%s focus_id=%s"):format(tostring(syntax), tostring(opts and opts.focus_id)), "WarningMsg" } }, true, {})
+    end
+    local bufnr, winid = state.hover_orig_ofp(contents, syntax, opts, ...)
+    if bufnr and opts and opts.focus_id == "textDocument/hover" and syntax == "markdown" then
+      local source = table.concat(contents, "\n")
+      if #source:gsub("%s", "") > 0 then
+        if not hover_cache[vim.fn.sha256(source)] and winid and vim.api.nvim_win_is_valid(winid) then
+          pcall(vim.api.nvim_win_set_config, winid, { title = " Translating... ", title_pos = "center" })
+        end
+        hover_dbg("translating hover (" .. #source .. " chars)")
+        translate_hover_text(source, function(translated, err)
+          if not translated then
+            if err then
+              vim.api.nvim_echo(
+                { { "[zeddit-hover] translation failed: " .. tostring(err), "WarningMsg" } },
+                true,
+                {}
+              )
+              local fw = vim.fn.bufwinid(bufnr)
+              if fw ~= -1 then
+                pcall(vim.api.nvim_win_set_config, fw, { title = " Translation failed ", title_pos = "center" })
+              end
+            end
+            return
+          end
+          if not vim.api.nvim_buf_is_valid(bufnr) then
+            hover_dbg("float buffer gone, translation dropped")
+            return
+          end
+          hover_dbg("replacing float contents (" .. #translated .. " chars)")
+          local fw = vim.fn.bufwinid(bufnr)
+          if fw ~= -1 then
+            pcall(vim.api.nvim_win_set_config, fw, { title = " Translated by zeddit ", title_pos = "center" })
+          end
+          local tlines = vim.split(translated, "\n", { plain = true })
+          vim.api.nvim_set_option_value("modifiable", true, { buf = bufnr })
+          vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, tlines)
+          vim.api.nvim_set_option_value("modifiable", false, { buf = bufnr })
+          if fw ~= -1 then
+            pcall(function()
+              local width, height = util._make_floating_popup_size(tlines, opts)
+              vim.api.nvim_win_set_width(fw, width)
+              vim.api.nvim_win_set_height(fw, height)
+            end)
+          end
+        end)
+      end
+    end
+    return bufnr, winid
+  end
+  util.open_floating_preview = state.hover_wrapper_ofp
+end
+
+-- noice.nvim replaces vim.lsp.buf.hover and renders through its own view
+-- system, never touching open_floating_preview. Hook its on_hover instead:
+-- the original English float shows instantly, and once the translation
+-- arrives the same hover message is re-rendered in place (Docs.get clears
+-- the memoized message, so a second on_hover pass is a clean update, not an
+-- append). If the float was closed meanwhile the translation stays in the
+-- cache and the next K on the same symbol opens in Chinese instantly.
+local function wrap_noice_hover()
+  local ok, hover = pcall(require, "noice.lsp.hover")
+  if not ok or type(hover) ~= "table" or type(hover.on_hover) ~= "function" then
+    return
+  end
+  if hover.on_hover == state.hover_wrapper_noice then
+    return
+  end
+  state.hover_orig_noice = hover.on_hover
+  state.hover_wrapper_noice = function(err, result, ctx, config)
+    if not (result and result.contents) then
+      return state.hover_orig_noice(err, result, ctx, config)
+    end
+    local source = table.concat(vim.lsp.util.convert_input_to_markdown_lines(result.contents), "\n")
+    if #source:gsub("%s", "") == 0 then
+      return state.hover_orig_noice(err, result, ctx, config)
+    end
+    local cached = hover_cache[vim.fn.sha256(source)]
+    if cached then
+      return state.hover_orig_noice(err, vim.tbl_extend("force", {}, result, {
+        contents = { kind = "markdown", value = cached },
+      }), ctx, config)
+    end
+    state.hover_orig_noice(err, result, ctx, config)
+    hover_dbg("translating noice hover (" .. #source .. " chars)")
+    translate_hover_text(source, function(translated, terr)
+      if not translated then
+        if terr then
+          vim.api.nvim_echo(
+            { { "[zeddit-hover] translation failed: " .. tostring(terr), "WarningMsg" } },
+            true,
+            {}
+          )
+        end
+        return
+      end
+      local ok_docs, docs = pcall(require, "noice.lsp.docs")
+      local ok_fmt, format = pcall(require, "noice.lsp.format")
+      local message = ok_docs and docs._messages and docs._messages.hover
+      if not (ok_docs and ok_fmt and message and message:win()) then
+        hover_dbg("noice hover closed, translation cached for next K")
+        return
+      end
+      hover_dbg("re-rendering noice hover translated (" .. #translated .. " chars)")
+      -- Do NOT re-enter on_hover here: its message:focus() guard would steal
+      -- the cursor into the open float and skip the update. Replicate its
+      -- benign half instead: clear + reformat + reshow the hover message.
+      local msg = docs.get("hover")
+      format.format(msg, { kind = "markdown", value = translated }, { ft = vim.bo[ctx.bufnr].filetype })
+      docs.show(msg)
+    end)
+  end
+  hover.on_hover = state.hover_wrapper_noice
+end
+
+local function install_hover_hook()
+  if not state.opts.hover_translate or state.hover_hook_wrapped then
+    return
+  end
+  state.hover_hook_wrapped = true
+  local function install_all()
+    wrap_hover_renderer()
+    wrap_noice_hover()
+  end
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = state.group,
+    callback = install_all,
+  })
+  vim.api.nvim_create_autocmd("User", {
+    group = state.group,
+    pattern = "VeryLazy",
+    callback = install_all,
+  })
+  install_all()
+  if state.opts.hover_debug then
+    local noice_src = "n/a"
+    local ok, nh = pcall(require, "noice.lsp.hover")
+    if ok and type(nh.on_hover) == "function" then
+      noice_src = debug.getinfo(nh.on_hover, "S").short_src
+    end
+    vim.api.nvim_echo({ { ("[zeddit-hover] hook installed: translate=%s ofp_src=%s noice_src=%s"):format(tostring(state.opts.hover_translate), debug.getinfo(vim.lsp.util.open_floating_preview, "S").short_src, noice_src), "WarningMsg" } }, true, {})
+  end
+end
+
+
 local function parse_output(raw, old_editable)
   if type(raw) ~= "string" or raw == "" then
     return nil
@@ -821,17 +1328,37 @@ local function request_now(bufnr, force)
     return
   end
 
-  local body = {
-    model = model,
-    prompt = context.prompt,
-    max_tokens = state.opts.max_tokens,
-    temperature = state.opts.temperature,
-    top_k = state.opts.top_k,
-    stop = { END_MARKER },
-  }
+  local fmt = resolve_format()
+  local body, url
+  if fmt == "Mellum2" then
+    body = {
+      model = model,
+      prompt = mellum_fim_prompt(context),
+      max_tokens = state.opts.fim_max_tokens,
+      -- Greedy decoding degenerates into exact-repeat loops on FIM; a small
+      -- temperature floor plus a mild repeat penalty keeps completions sane.
+      temperature = math.max(state.opts.temperature, 0.1),
+      top_k = state.opts.top_k,
+      repeat_penalty = 1.05,
+      -- "\n\n" stops the completion at the paragraph boundary: without it
+      -- the model free-runs through the whole token budget (a lone comment
+      -- can snowball into an entire file).
+      stop = { "<fim_prefix>", "<fim_suffix>", "<fim_middle>", "<|endoftext|>", "\n\n" },
+    }
+    url = completion_url(state.opts.provider_url)
+  else
+    body = {
+      model = model,
+      prompt = context.prompt,
+      max_tokens = state.opts.max_tokens,
+      temperature = state.opts.temperature,
+      top_k = state.opts.top_k,
+      stop = { END_MARKER },
+    }
+    url = completion_url(state.opts.provider_url)
+  end
 
   local payload = vim.json.encode(body)
-  local url = completion_url(state.opts.provider_url)
   local args = {
     "curl",
     "--noproxy",
@@ -888,8 +1415,12 @@ local function request_now(bufnr, force)
       end
 
       local choice = decoded.choices and decoded.choices[1]
-      local raw = choice and choice.text
-      local parsed = parse_output(raw, context.editable)
+      local parsed
+      if fmt == "Mellum2" then
+        parsed = parse_fim_output(choice and choice.text, context)
+      else
+        parsed = parse_output(choice and choice.text, context.editable)
+      end
       if parsed then
         set_preview(bufnr, context, parsed)
       end
@@ -994,6 +1525,9 @@ local number_keys = {
   editable_before_lines = true,
   editable_after_lines = true,
   context_max_chars = true,
+  fim_max_tokens = true,
+  fim_max_lines = true,
+  hover_max_tokens = true,
 }
 
 local integer_keys = {
@@ -1007,6 +1541,9 @@ local integer_keys = {
   editable_before_lines = true,
   editable_after_lines = true,
   context_max_chars = true,
+  fim_max_tokens = true,
+  fim_max_lines = true,
+  hover_max_tokens = true,
 }
 
 local function parse_bool(value)
@@ -1024,7 +1561,7 @@ local function parse_bool(value)
 end
 
 local function coerce_option(key, value)
-  if key == "enabled" or key == "notify_errors" then
+  if key == "enabled" or key == "notify_errors" or key == "hover_translate" or key == "hover_debug" then
     return parse_bool(value)
   end
   if number_keys[key] then
@@ -1123,6 +1660,7 @@ function M.enable(enable_opts)
   if enable_opts.persist ~= false then
     persist_now()
   end
+  sync_menu_labels()
 end
 
 function M.disable(disable_opts)
@@ -1139,6 +1677,7 @@ function M.disable(disable_opts)
   if disable_opts.persist ~= false then
     persist_now()
   end
+  sync_menu_labels()
 end
 
 function M.toggle()
@@ -1248,6 +1787,18 @@ local setting_fields = {
     desc = "Maximum tokens in the completion. Keep this small when n_ctx is 2048.",
   },
   {
+    key = "fim_max_tokens",
+    label = "FIM max tokens",
+    type = "integer",
+    desc = "Token budget for one Mellum2 FIM completion. Small (64-128) keeps ghost edits snappy.",
+  },
+  {
+    key = "fim_max_lines",
+    label = "FIM max lines",
+    type = "integer",
+    desc = "Client-side cap on ghost-edit length. The FIM middle is truncated after this many lines.",
+  },
+  {
     key = "prompt_budget_tokens",
     label = "Prompt budget",
     type = "integer",
@@ -1300,6 +1851,18 @@ local setting_fields = {
     label = "Notify errors",
     type = "boolean",
     desc = "Show a notification when a request fails.",
+  },
+  {
+    key = "hover_translate",
+    label = "Hover translate",
+    type = "boolean",
+    desc = "Translate LSP hover docs into Chinese. Requires Mellum2 (chat-capable); auto-disabled while the server runs Zeta (completion-only).",
+  },
+  {
+    key = "hover_max_tokens",
+    label = "Hover max tokens",
+    type = "integer",
+    desc = "Output token budget for one hover translation. Long docstrings need 4096+.",
   },
 }
 
@@ -1479,6 +2042,7 @@ function M.setup(user_opts)
   state.group = vim.api.nvim_create_augroup("zeddit", { clear = true })
 
   vim.api.nvim_set_hl(0, "ZedditGhost", { link = "Comment", default = true })
+  install_hover_hook()
   vim.api.nvim_set_hl(0, "ZedditEdit", { link = "DiagnosticVirtualTextInfo", default = true })
 
   vim.api.nvim_create_autocmd("BufEnter", {
@@ -1552,6 +2116,11 @@ function M.setup(user_opts)
   vim.api.nvim_create_user_command("ZedditToggle", function()
     M.toggle()
   end, { force = true })
+  vim.api.nvim_create_user_command("ZedditHoverToggle", function()
+    M.toggle_hover_translate()
+  end, { force = true })
+  -- Initial menu labels once which-key has finished loading.
+  vim.defer_fn(sync_menu_labels, 800)
   vim.api.nvim_create_user_command("ZedditToggleBuffer", function()
     M.toggle_buffer()
   end, { force = true })
@@ -1561,6 +2130,24 @@ function M.setup(user_opts)
     M.request(true)
   end, { force = true })
   vim.api.nvim_create_user_command("ZedditStatus", M.status, { force = true })
+  vim.api.nvim_create_user_command("ZedditHoverStatus", function()
+    local src = debug.getinfo(vim.lsp.util.open_floating_preview, "S").short_src
+    local noice_src = "n/a"
+    local ok, nh = pcall(require, "noice.lsp.hover")
+    if ok and type(nh.on_hover) == "function" then
+      noice_src = debug.getinfo(nh.on_hover, "S").short_src
+    end
+    vim.notify(
+      ("hover_translate=%s | ofp wrapped=%s | noice wrapped=%s | model=%s | debug=%s | url=%s"):format(
+        tostring(state.opts.hover_translate),
+        tostring(src:find("zeddit", 1, true) ~= nil),
+        tostring(noice_src:find("zeddit", 1, true) ~= nil),
+        tostring(hover_model.kind or "unknown"),
+        tostring(state.opts.hover_debug),
+        tostring(state.opts.provider_url)
+      )
+    )
+  end, { force = true })
   vim.api.nvim_create_user_command("ZedditConfig", M.configure, { force = true })
   vim.api.nvim_create_user_command("ZedditReset", M.reset_settings, { force = true })
 
